@@ -166,6 +166,9 @@ typedef struct DataraceInfo_t{
     Label * write1;
     // Last writer's CCT id
     ContextHandle_t  write1Context;
+
+    THREADID writerThread;
+    bool hasWriter = false;
 }DataraceInfo_t;
 
 // This is just a wrapper for a piece of Label along with a pointer to the location of the shadow memory.
@@ -367,6 +370,8 @@ static inline void UpdateShadowDataAtShadowAddress(DataraceInfo_t * shadowAddres
     shadowAddress->read2Context = info.read2Context;
     shadowAddress->write1 = info.write1;
     shadowAddress->write1Context = info.write1Context;
+    shadowAddress->writerThread = info.writerThread;
+    shadowAddress->hasWriter = info.hasWriter;
 
     // Update the version number at writeEnd
     shadowAddress->versionInfo.writeEnd.store(shadowAddress->versionInfo.writeStart, memory_order_release); //writeStart will be most upto date
@@ -380,6 +385,8 @@ static inline void ReadShadowData(DataraceInfo_t * info, DataraceInfo_t * shadow
     info->read2Context = shadowAddress->read2Context;
     info->write1 = shadowAddress->write1;
     info->write1Context = shadowAddress->write1Context;
+    info->writerThread = shadowAddress->writerThread;
+    info->hasWriter = shadowAddress->hasWriter;
 }
 
 // Snapshot is consistent iff both version numbers are same.
@@ -579,6 +586,19 @@ static inline void DumpRaceInfo(ContextHandle_t oldCtxt,Label * oldLbl, ContextH
     PIN_UnlockClient();
 }
 
+static inline bool SameThread(DataraceInfo_t * shadowData, THREADID threadId, bool accessType) {
+    if (!shadowData->hasWriter) {
+      if (accessType == WRITE_ACCESS) {
+          shadowData->hasWriter = true;
+          shadowData->writerThread = threadId;
+          return true;
+      } else {
+          return false;
+      }
+    }
+    return shadowData->writerThread == threadId;
+}
+
 static inline void CheckRead(DataraceInfo_t * shadowAddress, Label * myLabel, uint32_t opaqueHandle, THREADID threadId) {
     bool reported = false;
     // TODO .. Is this do-while excessive?
@@ -592,7 +612,7 @@ static inline void CheckRead(DataraceInfo_t * shadowAddress, Label * myLabel, ui
         
         // If we have reported a data race originating from this read
         // then let's not inundate with more data races at the same location.
-        if (!reported && !HappensBefore(shadowData.write1, myLabel)) {
+        if (!reported && !SameThread(&shadowData, threadId, READ_ACCESS) && !HappensBefore(shadowData.write1, myLabel)) {
             // Report W->R Data race
             fprintf(stderr, "\n W->R race");
             DumpRaceInfo(shadowData.write1Context, shadowData.write1, GetContextHandle(threadId, opaqueHandle), myLabel);
@@ -633,6 +653,7 @@ static inline void CheckRead(DataraceInfo_t * shadowAddress, Label * myLabel, ui
     }while(1);
 }
 
+
 static inline void CheckWrite(DataraceInfo_t * shadowAddress, Label * myLabel, uint32_t opaqueHandle, THREADID threadId) {
     bool reported = false;
     do {
@@ -650,19 +671,19 @@ static inline void CheckWrite(DataraceInfo_t * shadowAddress, Label * myLabel, u
 #endif
         // If we have reported a data race originating from this read
         // then let's not inundate with more data races at the same location.
-        if (!reported && !HappensBefore(shadowData.write1, myLabel)) {
+        if (!reported && !SameThread(&shadowData, threadId, WRITE_ACCESS) && !HappensBefore(shadowData.write1, myLabel)) {
             // Report W->W Data race
             reported = true;
             fprintf(stderr, "\n W->W race");
             DumpRaceInfo(shadowData.write1Context,shadowData.write1, GetContextHandle(threadId, opaqueHandle), myLabel);
         }
-        if (!reported && !HappensBefore(shadowData.read1, myLabel)) {
+        if (!reported && !SameThread(&shadowData, threadId, WRITE_ACCESS) && !HappensBefore(shadowData.read1, myLabel)) {
             // Report R->W Data race
             reported = true;
             fprintf(stderr, "\n R->W race");
             DumpRaceInfo(shadowData.read1Context, shadowData.read1, GetContextHandle(threadId, opaqueHandle), myLabel);
         }
-        if (!reported && !HappensBefore(shadowData.read2, myLabel)) {
+        if (!reported && !SameThread(&shadowData, threadId, WRITE_ACCESS) && !HappensBefore(shadowData.read2, myLabel)) {
             // Report R->W Data race
             fprintf(stderr, "\n R->W race");
             DumpRaceInfo(shadowData.read2Context, shadowData.read2, GetContextHandle(threadId, opaqueHandle), myLabel);
