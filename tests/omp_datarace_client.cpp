@@ -118,7 +118,7 @@ static Label ** gRegionIdToMasterLabelMap;
 // key for accessing TLS storage in the threads. initialized once in main()
 static  TLS_KEY tls_key;
 // Range of address where images to skip are loaded e.g., OMP runtime, linux loader.
-#define OMP_RUMTIMR_LIB_NAME "/home/xl10/support/gcc-4.7-install/lib64/libgomp.so.1"
+#define OMP_RUMTIMR_LIB_NAME "/projects/races/pkgs/gcc/lib64/libgomp.so.1"
 #define LINUX_LD_NAME    "/lib64/ld-linux-x86-64.so.2"
 #define MAX_SKIP_IMAGES (2)
 static ADDRINT gSkipImageAddressRanges[MAX_SKIP_IMAGES][2];
