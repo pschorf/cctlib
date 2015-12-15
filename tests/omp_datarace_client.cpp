@@ -916,14 +916,16 @@ void new_DYNAMIC_BEGIN_FN_NAME(uint64_t region_id, long span, long iter, unsigne
 }
 
 
-void new_DYNAMIC_END_FN_NAME(THREADID threadId){
+void new_DYNAMIC_END_FN_NAME(bool nowait, THREADID threadId){
     // Fetch current label and create new one
     Label * parentLabel =  GetMyLabel(threadId);
     Label * myLabel = new Label(CREATE_AFTER_JOIN, *parentLabel);
     SetMyLabel(threadId, myLabel);
-    Label * physParent = GetPhysicalLabel(threadId);
-    Label * physLabel = new Label(CREATE_AFTER_JOIN, *physParent);
-    SetPhysicalLabel(threadId, physLabel);
+    if (!nowait) {
+      Label * physParent = GetPhysicalLabel(threadId);
+      Label * physLabel = new Label(CREATE_AFTER_JOIN, *physParent);
+      SetPhysicalLabel(threadId, physLabel);
+    }
     return;
     //myLabel->PrintLabel();
 }
@@ -1007,9 +1009,10 @@ VOID Overrides (IMG img, VOID * v) {
     rtn = RTN_FindByName (img, DYNAMIC_END_FN_NAME);
     if (RTN_Valid (rtn)) {
         PROTO proto_end = PROTO_Allocate (PIN_PARG (void), CALLINGSTD_DEFAULT,
-                                          DYNAMIC_END_FN_NAME, PIN_PARG_END ());
+                                          DYNAMIC_END_FN_NAME, PIN_PARG (bool), PIN_PARG_END ());
         RTN_ReplaceSignature (rtn, AFUNPTR (new_DYNAMIC_END_FN_NAME),
                               IARG_PROTOTYPE, proto_end,
+			      IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
                               IARG_THREAD_ID, IARG_END);
         PROTO_Free (proto_end);
     }
