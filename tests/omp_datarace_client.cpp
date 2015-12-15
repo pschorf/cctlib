@@ -115,6 +115,7 @@ static const LabelSegment defaultExtension = {};
 static FILE *gTraceFile;
 const static char * HW_LOCK = "HW_LOCK";
 static Label ** gRegionIdToMasterLabelMap;
+static Label ** gRegionIdToPhysLabelMap;
 // key for accessing TLS storage in the threads. initialized once in main()
 static  TLS_KEY tls_key;
 // Range of address where images to skip are loaded e.g., OMP runtime, linux loader.
@@ -200,7 +201,7 @@ public:
     }
     
     // Initial label
-    Label() : m_labelLength(1), m_refCount(0){
+    Label() : m_labelLength(1), m_refCount(0) {
         m_LabelSegment = new LabelSegment[GetLength()];
         m_LabelSegment[0].offset = 0;
         m_LabelSegment[0].span = 1;
@@ -229,7 +230,7 @@ public:
         for(; i < GetLength()-1; i++){
             m_LabelSegment[i] = label.m_LabelSegment[i];
         }
-        m_LabelSegment[i] = extension;
+          m_LabelSegment[i] = extension;
     }
     
     // After a join, a the last segment should be dropped and offset should be incremented by span
@@ -316,12 +317,14 @@ public:
 // Holds thread local info
 class ThreadData_t {
     Label * m_curLable;
+    Label * m_physicalLabel;
     ADDRINT m_stackBaseAddress;
     ADDRINT m_stackEndAddress;
     ADDRINT m_stackCurrentFrameBaseAddress;
 public:
     ThreadData_t(ADDRINT stackBaseAddress, ADDRINT stackEndAddress, ADDRINT stackCurrentFrameBaseAddress) :
     m_curLable(NULL),
+    m_physicalLabel(NULL),
     m_stackBaseAddress(stackBaseAddress),
     m_stackEndAddress(stackEndAddress),
     m_stackCurrentFrameBaseAddress(stackCurrentFrameBaseAddress){}
@@ -329,6 +332,10 @@ public:
     inline void SetLabel(Label * label) {
         // TODO: If the current label had a zero ref count, we can possibly delete it
         m_curLable = label;
+    }
+    inline Label * GetPhysicalLabel() const { return m_physicalLabel; }
+    inline void SetPhysicalLabel(Label * label) {
+       m_physicalLabel = label;
     }
 };
 
@@ -441,9 +448,17 @@ static inline Label * GetMyLabel(THREADID threadId) {
     return GetTLS(threadId)->GetLabel();
 }
 
+static inline Label * GetPhysicalLabel(THREADID threadId) {
+    return GetTLS(threadId)->GetPhysicalLabel();
+}
+
 // Fetch the current threads's logical label
 static inline void SetMyLabel(THREADID threadId, Label * label) {
     GetTLS(threadId)->SetLabel(label);
+}
+
+static inline void SetPhysicalLabel(THREADID threadId, Label * label) {
+   GetTLS(threadId)->SetPhysicalLabel(label);
 }
 
 static inline void UpdateLabel(Label ** oldLabel, Label * newLabel){
@@ -794,20 +809,28 @@ void new_MASTER_BEGIN_FN_NAME(uint64_t region_id, long span, THREADID threadid){
     assert(region_id < MAX_REGIONS);
     // Publish my label into the labelHashTable
     assert(gRegionIdToMasterLabelMap[region_id] == 0);
+    assert(gRegionIdToPhysLabelMap[region_id] == 0);
     Label * myLabel =  GetMyLabel(threadid);
+    Label * physLabel = GetPhysicalLabel(threadid);
     // if the label was NULL, let us create a new initial label
     if (myLabel == NULL) {
         myLabel = new Label();
         SetMyLabel(threadid, myLabel);
     }
+    if (physLabel == NULL) {
+        physLabel = new Label();
+        SetPhysicalLabel(threadid, physLabel);
+    }
     gRegionIdToMasterLabelMap[region_id] = myLabel;
+    gRegionIdToPhysLabelMap[region_id] = myLabel;
 }
 
-void new_DYNAMIC_BEGIN_FN_NAME(uint64_t region_id, long span, long iter, THREADID threadid){
+void new_DYNAMIC_BEGIN_FN_NAME(uint64_t region_id, long span, long iter, unsigned nthreads, THREADID threadid){
     // Fetch parent label and create new one
     //fprintf(stderr,"\n fetched parent label");
     
     assert(gRegionIdToMasterLabelMap[region_id] != NULL);
+    assert(gRegionIdToPhysLabelMap[region_id] != NULL);
     
     Label * parentLabel =  gRegionIdToMasterLabelMap[region_id];
     // Create child label
@@ -817,6 +840,15 @@ void new_DYNAMIC_BEGIN_FN_NAME(uint64_t region_id, long span, long iter, THREADI
     extension.phase = 0;
     Label * myLabel = new Label(CREATE_AFTER_FORK, *parentLabel, extension);
     SetMyLabel(threadid, myLabel);
+
+    Label * physParent = gRegionIdToPhysLabelMap[region_id];
+    LabelSegment physExtension;
+    physExtension.span = nthreads;
+    physExtension.offset = threadid;
+    physExtension.phase = 0;
+    Label * physLabel = new Label(CREATE_AFTER_FORK, *physParent, physExtension);
+    SetPhysicalLabel(threadid, physLabel);
+    physLabel->PrintLabel();
     //myLabel->PrintLabel();
 }
 
@@ -826,6 +858,9 @@ void new_DYNAMIC_END_FN_NAME(THREADID threadId){
     Label * parentLabel =  GetMyLabel(threadId);
     Label * myLabel = new Label(CREATE_AFTER_JOIN, *parentLabel);
     SetMyLabel(threadId, myLabel);
+    Label * physParent = GetPhysicalLabel(threadId);
+    Label * physLabel = new Label(CREATE_AFTER_JOIN, *physParent);
+    SetPhysicalLabel(threadId, physLabel);
     return;
     //myLabel->PrintLabel();
 }
@@ -893,13 +928,14 @@ VOID Overrides (IMG img, VOID * v) {
     rtn = RTN_FindByName (img, DYNAMIC_BEGIN_FN_NAME);
     if (RTN_Valid (rtn)) {
         PROTO proto_worker = PROTO_Allocate (PIN_PARG (void), CALLINGSTD_DEFAULT,
-                                             DYNAMIC_BEGIN_FN_NAME, PIN_PARG (uint64_t),PIN_PARG (long),PIN_PARG (long),
+                                             DYNAMIC_BEGIN_FN_NAME, PIN_PARG (uint64_t),PIN_PARG (long),PIN_PARG (long), PIN_PARG (unsigned),
                                              PIN_PARG_END ());
         RTN_ReplaceSignature (rtn, AFUNPTR (new_DYNAMIC_BEGIN_FN_NAME),
                               IARG_PROTOTYPE, proto_worker,
                               IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
                               IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
                               IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
+                              IARG_FUNCARG_ENTRYPOINT_VALUE, 3,
                               IARG_THREAD_ID, IARG_END);
         PROTO_Free (proto_worker);
     }
@@ -1054,6 +1090,7 @@ void InitDataRaceSpy(int argc, char *argv[]){
     
     // Allocate gRegionIdToMasterLabelMap
     gRegionIdToMasterLabelMap = (Label **) calloc(sizeof(Label*) * MAX_REGIONS, 1);
+    gRegionIdToPhysLabelMap = (Label **) calloc(sizeof(Label*) * MAX_REGIONS, 1);
     
     // Obtain  a key for TLS storage.
     tls_key = PIN_CreateThreadDataKey(0);
