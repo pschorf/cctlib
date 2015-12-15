@@ -145,15 +145,7 @@ typedef struct VersionInfo_t{
     };
 }VersionInfo_t;
 
-
-// 2 readers and 1 writer are recorded per byte of memory.
-// In addition, a concurrency control mechanism is used for atomic accesses to the shadow memory.
-// TODO: One may optimize the granularity of locking
-
-typedef struct DataraceInfo_t{
-    // Concurreny control via versioning
-    VersionInfo_t versionInfo;
-
+typedef struct LabelSet_t{
     // Read1's label
     Label * read1;
     //Reader1's CCT id
@@ -168,9 +160,21 @@ typedef struct DataraceInfo_t{
     Label * write1;
     // Last writer's CCT id
     ContextHandle_t  write1Context;
+}LabelSet_t;
 
-    THREADID writerThread;
-    bool hasWriter = false;
+
+
+// 2 readers and 1 writer are recorded per byte of memory.
+// In addition, a concurrency control mechanism is used for atomic accesses to the shadow memory.
+// TODO: One may optimize the granularity of locking
+
+typedef struct DataraceInfo_t{
+    // Concurreny control via versioning
+    VersionInfo_t versionInfo;
+    
+    LabelSet_t logical;
+    LabelSet_t physical;
+
 }DataraceInfo_t;
 
 // This is just a wrapper for a piece of Label along with a pointer to the location of the shadow memory.
@@ -181,6 +185,12 @@ typedef struct ExtendedDataraceInfo_t{
     DataraceInfo_t data;
 }ExtendedDataraceInfo_t;
 
+typedef struct RaceInfo_t {
+  ContextHandle_t oldCtxt;
+  Label * oldLbl;
+  ContextHandle_t newCtxt;
+  Label * newLbl;
+}RaceInfo_t;
 
 
 // A label is a concatenation of several LabelSegments
@@ -236,8 +246,12 @@ public:
     // After a join, a the last segment should be dropped and offset should be incremented by span
     // TODO: possible memory leak? refcount?
     void LabelCreateAfterJoin(const Label & label){
-        assert(label.GetLength() > 1);
-        SetLength(label.GetLength() - 1);
+        //assert(label.GetLength() > 1);
+        if (label.GetLength() > 1) {
+          SetLength(label.GetLength() - 1);
+        } else {
+          SetLength(1);
+        }
         m_LabelSegment = new LabelSegment[GetLength()];
         uint8_t i = 0;
         
@@ -370,16 +384,19 @@ static inline volatile atomic<uint64_t> * GetWriteStartAddressForLoc( DataraceIn
     return &(shadowAddress->versionInfo.writeEnd);
 }
 
-// Updates the shadow memory with new labels and contexts information
-static inline void UpdateShadowDataAtShadowAddress(DataraceInfo_t * shadowAddress, const DataraceInfo_t &  info){
+static inline void UpdateLabelSet(LabelSet_t * shadowAddress, LabelSet_t info) {
     shadowAddress->read1 = info.read1;
     shadowAddress->read1Context = info.read1Context;
     shadowAddress->read2 = info.read2;
     shadowAddress->read2Context = info.read2Context;
     shadowAddress->write1 = info.write1;
     shadowAddress->write1Context = info.write1Context;
-    shadowAddress->writerThread = info.writerThread;
-    shadowAddress->hasWriter = info.hasWriter;
+}
+
+// Updates the shadow memory with new labels and contexts information
+static inline void UpdateShadowDataAtShadowAddress(DataraceInfo_t * shadowAddress, const DataraceInfo_t &  info){
+    UpdateLabelSet(&shadowAddress->logical, info.logical);
+    UpdateLabelSet(&shadowAddress->physical, info.physical);
 
     // Update the version number at writeEnd
     shadowAddress->versionInfo.writeEnd.store(shadowAddress->versionInfo.writeStart, memory_order_release); //writeStart will be most upto date
@@ -387,14 +404,19 @@ static inline void UpdateShadowDataAtShadowAddress(DataraceInfo_t * shadowAddres
 
 // Reads the labels and contexts from shadow memory
 static inline void ReadShadowData(DataraceInfo_t * info, DataraceInfo_t * shadowAddress){
-    info->read1 = shadowAddress->read1;
-    info->read1Context = shadowAddress->read1Context;
-    info->read2 = shadowAddress->read2;
-    info->read2Context = shadowAddress->read2Context;
-    info->write1 = shadowAddress->write1;
-    info->write1Context = shadowAddress->write1Context;
-    info->writerThread = shadowAddress->writerThread;
-    info->hasWriter = shadowAddress->hasWriter;
+    info->logical.read1 = shadowAddress->logical.read1;
+    info->logical.read1Context = shadowAddress->logical.read1Context;
+    info->logical.read2 = shadowAddress->logical.read2;
+    info->logical.read2Context = shadowAddress->logical.read2Context;
+    info->logical.write1 = shadowAddress->logical.write1;
+    info->logical.write1Context = shadowAddress->logical.write1Context;
+
+    info->physical.read1 = shadowAddress->physical.read1;
+    info->physical.read1Context = shadowAddress->physical.read1Context;
+    info->physical.read2 = shadowAddress->physical.read2;
+    info->physical.read2Context = shadowAddress->physical.read2Context;
+    info->physical.write1 = shadowAddress->physical.write1;
+    info->physical.write1Context = shadowAddress->physical.write1Context;
 }
 
 // Snapshot is consistent iff both version numbers are same.
@@ -590,29 +612,16 @@ static inline bool MaximizesExitRank(const Label * const newLabel, const Label *
 }
 
 
-static inline void DumpRaceInfo(ContextHandle_t oldCtxt,Label * oldLbl, ContextHandle_t newCtxt, Label * newLbl){
+static inline void DumpRaceInfo(const RaceInfo_t & info){
     PIN_LockClient();
     fprintf(gTraceFile, "\n ----------");
-    oldLbl->PrintLabel();
-    PrintFullCallingContext(oldCtxt);
+    info.oldLbl->PrintLabel();
+    PrintFullCallingContext(info.oldCtxt);
     fprintf(gTraceFile, "\n *****RACES WITH*****");
-    newLbl->PrintLabel();
-    PrintFullCallingContext(newCtxt);
+    info.newLbl->PrintLabel();
+    PrintFullCallingContext(info.newCtxt);
     fprintf(gTraceFile, "\n ----------");
     PIN_UnlockClient();
-}
-
-static inline bool SameThread(DataraceInfo_t * shadowData, THREADID threadId, bool accessType) {
-    if (!shadowData->hasWriter) {
-      if (accessType == WRITE_ACCESS) {
-          shadowData->hasWriter = true;
-          shadowData->writerThread = threadId;
-          return true;
-      } else {
-          return false;
-      }
-    }
-    return shadowData->writerThread == threadId;
 }
 
 static inline void CheckRead(DataraceInfo_t * shadowAddress, Label * myLabel, uint32_t opaqueHandle, THREADID threadId) {
@@ -621,6 +630,7 @@ static inline void CheckRead(DataraceInfo_t * shadowAddress, Label * myLabel, ui
     do{
         DataraceInfo_t shadowData;
         ReadShadowMemory(shadowAddress, &shadowData);
+        LabelSet_t * logical = &shadowData.logical;
         bool updated1 = false;
         Label * oldR1Label = NULL;
         Label * oldR2Label = NULL;
@@ -628,27 +638,32 @@ static inline void CheckRead(DataraceInfo_t * shadowAddress, Label * myLabel, ui
         
         // If we have reported a data race originating from this read
         // then let's not inundate with more data races at the same location.
-        if (!reported && !SameThread(&shadowData, threadId, READ_ACCESS) && !HappensBefore(shadowData.write1, myLabel)) {
+        if (!reported && !HappensBefore(logical->write1, myLabel)) {
             // Report W->R Data race
             fprintf(stderr, "\n W->R race");
-            DumpRaceInfo(shadowData.write1Context, shadowData.write1, GetContextHandle(threadId, opaqueHandle), myLabel);
+	    RaceInfo_t raceInfo;
+            raceInfo.oldCtxt = logical->write1Context;
+            raceInfo.oldLbl = logical->write1;
+	    raceInfo.newCtxt = GetContextHandle(threadId, opaqueHandle);
+            raceInfo.newLbl = myLabel;
+            DumpRaceInfo(raceInfo);
             reported = true;
         }
         
         // Update labels
         /* TODO replace HappensBefore with SAME THREAD */
-        if(MaximizesExitRank(myLabel, shadowData.read1) || IsLeftOf(myLabel, shadowData.read1) || HappensBefore(shadowData.read1, myLabel)) {
-            oldR1Label = shadowData.read1;
-            UpdateLabel(&shadowData.read1, myLabel);
-            UpdateContext(&shadowData.read1Context, GetContextHandle(threadId, opaqueHandle));
+        if(MaximizesExitRank(myLabel, logical->read1) || IsLeftOf(myLabel, logical->read1) || HappensBefore(logical->read1, myLabel)) {
+            oldR1Label = logical->read1;
+            UpdateLabel(&logical->read1, myLabel);
+            UpdateContext(&logical->read1Context, GetContextHandle(threadId, opaqueHandle));
             updated1 = true;
         }
         
         /* TODO replace HappensBefore with SAME THREAD */
-        if( (shadowData.read2 && IsLeftOf(shadowData.read2, myLabel))  || HappensBefore(shadowData.read2, myLabel)) {
-            oldR2Label = shadowData.read2;
-            UpdateLabel(&shadowData.read2, myLabel);
-            UpdateContext(&shadowData.read2Context, GetContextHandle(threadId, opaqueHandle));
+        if( (logical->read2 && IsLeftOf(logical->read2, myLabel))  || HappensBefore(logical->read2, myLabel)) {
+            oldR2Label = logical->read2;
+            UpdateLabel(&logical->read2, myLabel);
+            UpdateContext(&logical->read2Context, GetContextHandle(threadId, opaqueHandle));
             updated2 = true;
         }
         
@@ -670,45 +685,74 @@ static inline void CheckRead(DataraceInfo_t * shadowAddress, Label * myLabel, ui
 }
 
 
-static inline void CheckWrite(DataraceInfo_t * shadowAddress, Label * myLabel, uint32_t opaqueHandle, THREADID threadId) {
-    bool reported = false;
-    do {
-        DataraceInfo_t shadowData;
-        ReadShadowMemory(shadowAddress, &shadowData);
+static inline RaceInfo_t * CheckWriteHelper(const LabelSet_t & labels, Label * myLabel, uint32_t opaqueHandle, THREADID threadId) {
         //#define DEBUG
 #ifdef DEBUG
-        if(shadowData.write1) {
+        if(labels.write1) {
             fprintf(stderr,"\n Comparing labels:");
             myLabel->PrintLabel();
-            shadowData.write1->PrintLabel();
+            labels.write1->PrintLabel();
         } else {
-            fprintf(stderr,"\n shadowData.write1 is NULL");
+            fprintf(stderr,"\n logical.write1 is NULL");
         }
 #endif
         // If we have reported a data race originating from this read
         // then let's not inundate with more data races at the same location.
-        if (!reported && !SameThread(&shadowData, threadId, WRITE_ACCESS) && !HappensBefore(shadowData.write1, myLabel)) {
+        if (!HappensBefore(labels.write1, myLabel)) {
             // Report W->W Data race
-            reported = true;
-            fprintf(stderr, "\n W->W race");
-            DumpRaceInfo(shadowData.write1Context,shadowData.write1, GetContextHandle(threadId, opaqueHandle), myLabel);
+            struct RaceInfo_t *info = (RaceInfo_t *) malloc(sizeof(struct RaceInfo_t));
+            info->oldCtxt = labels.write1Context;
+            info->oldLbl = labels.write1;
+            info->newCtxt = GetContextHandle(threadId, opaqueHandle);
+            info->newLbl = myLabel;
+	    return info;
         }
-        if (!reported && !SameThread(&shadowData, threadId, WRITE_ACCESS) && !HappensBefore(shadowData.read1, myLabel)) {
+        if (!HappensBefore(labels.read1, myLabel)) {
             // Report R->W Data race
-            reported = true;
-            fprintf(stderr, "\n R->W race");
-            DumpRaceInfo(shadowData.read1Context, shadowData.read1, GetContextHandle(threadId, opaqueHandle), myLabel);
+            struct RaceInfo_t *info = (RaceInfo_t *) malloc(sizeof(struct RaceInfo_t));
+            info->oldCtxt = labels.read1Context;
+            info->oldLbl = labels.read1;
+            info->newCtxt = GetContextHandle(threadId, opaqueHandle);
+            info->newLbl = myLabel;
+	    return info;
         }
-        if (!reported && !SameThread(&shadowData, threadId, WRITE_ACCESS) && !HappensBefore(shadowData.read2, myLabel)) {
+        if (!HappensBefore(labels.read2, myLabel)) {
             // Report R->W Data race
-            fprintf(stderr, "\n R->W race");
-            DumpRaceInfo(shadowData.read2Context, shadowData.read2, GetContextHandle(threadId, opaqueHandle), myLabel);
-            reported = true;
+            struct RaceInfo_t *info = (RaceInfo_t *) malloc(sizeof(struct RaceInfo_t));
+            info->oldCtxt = labels.read2Context;
+            info->oldLbl = labels.read2;
+            info->newCtxt = GetContextHandle(threadId, opaqueHandle);
+            info->newLbl = myLabel;
+	    return info;
         }
-        Label * oldW1Label = shadowData.write1;
+  return NULL;
+}
+
+static inline void CheckWrite(DataraceInfo_t * shadowAddress, Label * myLabel, Label * physicalLabel, uint32_t opaqueHandle, THREADID threadId) {
+    bool reported = false;
+    do {
+        DataraceInfo_t shadowData;
+        ReadShadowMemory(shadowAddress, &shadowData);
+        LabelSet_t * logical = &shadowData.logical;
+        LabelSet_t * physical = &shadowData.physical;
+	RaceInfo_t * race = CheckWriteHelper(*logical, myLabel, opaqueHandle, threadId);
+	RaceInfo_t * physicalRace = CheckWriteHelper(*physical, physicalLabel, opaqueHandle, threadId);
+ 	if (race != NULL && physicalRace != NULL && !reported) {
+	  DumpRaceInfo(*physicalRace);
+          reported = true;
+        }
+        if (race != NULL) {
+           free(race);
+        }
+        if (physicalRace != NULL) {
+          free(physicalRace);
+	}
+        Label * oldW1Label = logical->write1;
         // Update label
-        UpdateLabel(&shadowData.write1, myLabel);
-        UpdateContext(&shadowData.write1Context, GetContextHandle(threadId, opaqueHandle));
+        UpdateLabel(&logical->write1, myLabel);
+        UpdateContext(&logical->write1Context, GetContextHandle(threadId, opaqueHandle));
+        UpdateLabel(&physical->write1, physicalLabel);
+        UpdateContext(&physical->write1Context, GetContextHandle(threadId, opaqueHandle));
         if(!TryWriteShadowMemory(shadowAddress, shadowData)) {
             // someone updated the shadow memory before we could, we need to redo the entire process
             continue;
@@ -718,11 +762,10 @@ static inline void CheckWrite(DataraceInfo_t * shadowAddress, Label * myLabel, u
     }while(1);
 }
 
-
 // Run the datarace protocol and report race.
-static inline void ExecuteOffsetSpanPhaseProtocol(DataraceInfo_t *status, Label * myLabel, bool accessType, uint32_t opaqueHandle, THREADID threadId) {
+static inline void ExecuteOffsetSpanPhaseProtocol(DataraceInfo_t *status, Label * myLabel, Label * physicalLabel, bool accessType, uint32_t opaqueHandle, THREADID threadId) {
     if(accessType == WRITE_ACCESS){
-        CheckWrite(status, myLabel, opaqueHandle, threadId);
+        CheckWrite(status, myLabel, physicalLabel, opaqueHandle, threadId);
     } else { // READ_ACCESS
         CheckRead(status, myLabel, opaqueHandle, threadId);
     }
@@ -735,6 +778,8 @@ static inline VOID CheckRace( VOID * addr, uint32_t accessLen, bool accessType, 
     // if myLabel is NULL, then we are in the initial serial part of the program, hence we can skip the rest
     if (myLabel == NULL)
         return;
+
+    Label * physicalLabel = GetPhysicalLabel(threadId);
     
     DataraceInfo_t * status = GetOrCreateShadowBaseAddress<DataraceInfo_t>(addr);
     int overflow = (int)(PAGE_OFFSET((uint64_t)addr)) -  (int)((PAGE_OFFSET_MASK - (accessLen-1)));
@@ -744,18 +789,18 @@ static inline VOID CheckRace( VOID * addr, uint32_t accessLen, bool accessType, 
         // The accessed word's shadow memory does not straddle 2 64K shadow pages.
         // Execute the protocol for each byte of the memory accessed.
         for(uint32_t i = 0 ; i < accessLen; i++){
-            ExecuteOffsetSpanPhaseProtocol(&status[i], myLabel, accessType, opaqueHandle, threadId);
+            ExecuteOffsetSpanPhaseProtocol(&status[i], myLabel, physicalLabel, accessType, opaqueHandle, threadId);
         }
     } else {
         // The accessed word's shadow memory straddles 2 64K shadow pages.
         // Execute the protocol for each byte of the memory accessed in the first page
         for(uint32_t nonOverflowBytes = 0 ; nonOverflowBytes < accessLen - overflow; nonOverflowBytes++){
-            ExecuteOffsetSpanPhaseProtocol(&status[nonOverflowBytes], myLabel, accessType, opaqueHandle, threadId);
+            ExecuteOffsetSpanPhaseProtocol(&status[nonOverflowBytes], myLabel, physicalLabel, accessType, opaqueHandle, threadId);
         }
         // Execute the protocol for each byte of the memory accessed in the next page
         status = GetOrCreateShadowBaseAddress<DataraceInfo_t>(((char *)addr) + accessLen); // +accessLen so that we get next page
         for( int i = 0; i < overflow; i++){
-            ExecuteOffsetSpanPhaseProtocol(&status[i], myLabel, accessType, opaqueHandle, threadId);
+            ExecuteOffsetSpanPhaseProtocol(&status[i], myLabel, physicalLabel, accessType, opaqueHandle, threadId);
         }
         // TODO: We never expect the access to straddle more than 2 pages. If that happens we are hosed.
     }
@@ -785,7 +830,7 @@ static inline bool IsIgnorableIns(INS ins){
 }
 #define MASTER_BEGIN_FN_NAME "gomp_datarace_master_begin_dynamic_work"
 #define DYNAMIC_BEGIN_FN_NAME "gomp_datarace_begin_dynamic_work"
-#define DYNAMIC_END_FN_NAME "gomp_datarace_master_end_dynamic_work"
+#define DYNAMIC_END_FN_NAME "gomp_datarace_end_dynamic_work"
 #define ORDERED_ENTER_FN_NAME "gomp_datarace_begin_ordered_section"
 #define ORDERED_EXIT_FN_NAME "gomp_datarace_end_ordered_section"
 #define CRITICAL_ENTER_FN_NAME "gomp_datarace_begin_critical"
@@ -848,7 +893,6 @@ void new_DYNAMIC_BEGIN_FN_NAME(uint64_t region_id, long span, long iter, unsigne
     physExtension.phase = 0;
     Label * physLabel = new Label(CREATE_AFTER_FORK, *physParent, physExtension);
     SetPhysicalLabel(threadid, physLabel);
-    physLabel->PrintLabel();
     //myLabel->PrintLabel();
 }
 
