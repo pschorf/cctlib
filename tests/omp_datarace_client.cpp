@@ -624,13 +624,20 @@ static inline void DumpRaceInfo(const RaceInfo_t & info){
     PIN_UnlockClient();
 }
 
-static inline void CheckRead(DataraceInfo_t * shadowAddress, Label * myLabel, uint32_t opaqueHandle, THREADID threadId) {
+
+static inline RaceInfo_t * CheckReadHelper(DataraceInfo_t * shadowAddress, Label * myLabel, uint32_t opaqueHandle, THREADID threadId, bool checkPhysical) {
     bool reported = false;
     // TODO .. Is this do-while excessive?
+    RaceInfo_t * info = NULL;
     do{
         DataraceInfo_t shadowData;
         ReadShadowMemory(shadowAddress, &shadowData);
-        LabelSet_t * logical = &shadowData.logical;
+        LabelSet_t * logical;
+	if (checkPhysical) {
+           logical = &shadowData.physical;
+        } else {
+           logical = &shadowData.logical;
+        }
         bool updated1 = false;
         Label * oldR1Label = NULL;
         Label * oldR2Label = NULL;
@@ -640,13 +647,11 @@ static inline void CheckRead(DataraceInfo_t * shadowAddress, Label * myLabel, ui
         // then let's not inundate with more data races at the same location.
         if (!reported && !HappensBefore(logical->write1, myLabel)) {
             // Report W->R Data race
-            fprintf(stderr, "\n W->R race");
-	    RaceInfo_t raceInfo;
-            raceInfo.oldCtxt = logical->write1Context;
-            raceInfo.oldLbl = logical->write1;
-	    raceInfo.newCtxt = GetContextHandle(threadId, opaqueHandle);
-            raceInfo.newLbl = myLabel;
-            DumpRaceInfo(raceInfo);
+            info = (RaceInfo_t *) malloc(sizeof(struct RaceInfo_t));
+            info->oldCtxt = logical->write1Context;
+            info->oldLbl = logical->write1;
+	    info->newCtxt = GetContextHandle(threadId, opaqueHandle);
+            info->newLbl = myLabel;
             reported = true;
         }
         
@@ -682,8 +687,22 @@ static inline void CheckRead(DataraceInfo_t * shadowAddress, Label * myLabel, ui
         }
         break;
     }while(1);
+    return info;
 }
 
+static inline void CheckRead(DataraceInfo_t * shadowAddress, Label * myLabel, Label * physicalLabel, uint32_t opaqueHandle, THREADID threadId) {
+  RaceInfo_t * logicalRace = CheckReadHelper(shadowAddress, myLabel, opaqueHandle, threadId, false);
+  RaceInfo_t * physicalRace = CheckReadHelper(shadowAddress, physicalLabel, opaqueHandle, threadId, true);
+  if (logicalRace != NULL && physicalRace != NULL) {
+    DumpRaceInfo(*physicalRace);
+  }
+  if (logicalRace != NULL) {
+     free(logicalRace);
+  }
+  if (physicalRace != NULL) {
+    free(physicalRace);
+  } 
+}
 
 static inline RaceInfo_t * CheckWriteHelper(const LabelSet_t & labels, Label * myLabel, uint32_t opaqueHandle, THREADID threadId) {
         //#define DEBUG
@@ -767,7 +786,7 @@ static inline void ExecuteOffsetSpanPhaseProtocol(DataraceInfo_t *status, Label 
     if(accessType == WRITE_ACCESS){
         CheckWrite(status, myLabel, physicalLabel, opaqueHandle, threadId);
     } else { // READ_ACCESS
-        CheckRead(status, myLabel, opaqueHandle, threadId);
+        CheckRead(status, myLabel, physicalLabel, opaqueHandle, threadId);
     }
 }
 
